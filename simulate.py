@@ -45,9 +45,7 @@ def run_simulation(n: int = 30, delay: float = 0.2, mode: str = 'multiclass'):
 
     # Load model and test data
     model = joblib.load('models/best_model.pkl')
-    _, X_test, _, y_test, _ = preprocess(mode=mode, save_artifacts=False)
-
-    label_names = LABEL_NAMES if mode == 'multiclass' else LABEL_NAMES_BINARY
+    _, X_test, _, y_test, _, label_names = preprocess(mode=mode, save_artifacts=False)
 
     # Shuffle for variety
     indices = np.random.permutation(len(X_test))[:n]

@@ -119,7 +119,7 @@ def evaluate(mode: str = 'multiclass'):
     best_model = joblib.load('models/best_model.pkl')
 
     # Re-run preprocessing to get test set
-    _, X_test, _, y_test, _ = preprocess(mode=mode, save_artifacts=False)
+    _, X_test, _, y_test, _, label_names = preprocess(mode=mode, save_artifacts=False)
     y_pred = best_model.predict(X_test)
 
     label_names = LABEL_NAMES_MULTI if mode == 'multiclass' else LABEL_NAMES_BINARY

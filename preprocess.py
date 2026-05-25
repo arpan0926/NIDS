@@ -15,20 +15,103 @@ import joblib
 
 from columns import COLUMNS, CATEGORICAL_COLS, ATTACK_MAP, LABEL_ENCODING
 
+UNSW_TRAIN_FILE = 'UNSW_NB15_training-set.parquet'
+UNSW_TEST_FILE  = 'UNSW_NB15_testing-set.parquet'
+UNSW_CATEGORICAL_COLS = ['proto', 'service', 'state']
+UNSW_ONEHOT_COLS = ['service', 'state']
+UNSW_FREQ_COL = 'proto_freq'
+NSL_LABEL_NAMES = {v: k for k, v in LABEL_ENCODING.items()}
+LABEL_NAMES_BINARY = {0: 'Normal', 1: 'Attack'}
+
 
 def load_raw(path: str) -> pd.DataFrame:
-    """Load raw NSL-KDD .txt file into a DataFrame."""
+    """Load raw NSL-KDD or UNSW-NB15 dataset into a DataFrame."""
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Dataset not found at '{path}'.\n"
-            "Download from: https://www.unb.ca/cic/datasets/nsl.html\n"
-            "Place KDDTrain+.txt and KDDTest+.txt inside the data/ folder."
+            "Place KDDTrain+.txt and KDDTest+.txt inside the data/ folder,"
+            " or place NLS-KDD.txt or UNSW_NB15 training/testing parquet files in the repo root."
         )
-    df = pd.read_csv(path, header=None, names=COLUMNS)
+
+    if path.lower().endswith('.parquet'):
+        return pd.read_parquet(path)
+
+    return pd.read_csv(path, header=None, names=COLUMNS)
+
+
+def discover_dataset_paths(train_path: str, test_path: str):
+    if os.path.exists(UNSW_TRAIN_FILE) and os.path.exists(UNSW_TEST_FILE):
+        return UNSW_TRAIN_FILE, UNSW_TEST_FILE
+
+    if os.path.exists(train_path) and os.path.exists(test_path):
+        return train_path, test_path
+
+    combined_path = 'NLS-KDD.txt'
+    if os.path.exists(combined_path):
+        print(f"[INFO] Found combined dataset file '{combined_path}'. Splitting into train/test.")
+        return combined_path, None
+
+    return train_path, test_path
+
+
+def map_unsw_labels(train_df: pd.DataFrame, test_df: pd.DataFrame, mode: str = 'binary'):
+    if mode == 'binary':
+        train_df['label'] = train_df['label'].astype(int)
+        test_df['label']  = test_df['label'].astype(int)
+        label_names = {0: 'Normal', 1: 'Attack'}
+
+    elif mode == 'multiclass':
+        encoder = LabelEncoder()
+        all_cats = pd.concat([
+            train_df['attack_cat'].astype(str),
+            test_df['attack_cat'].astype(str)
+        ], ignore_index=True)
+        encoder.fit(all_cats)
+
+        train_df['label'] = encoder.transform(train_df['attack_cat'].astype(str))
+        test_df['label']  = encoder.transform(test_df['attack_cat'].astype(str))
+        label_names = {int(i): name for i, name in enumerate(encoder.classes_)}
+
+    else:
+        raise ValueError("mode must be 'binary' or 'multiclass'")
+
+    return train_df, test_df, label_names
+
+
+def add_unsw_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Create UNSW-specific numeric features from packet and byte counts."""
+    df = df.copy()
+    df['total_bytes'] = df['sbytes'] + df['dbytes']
+    df['total_pkts'] = df['spkts'] + df['dpkts']
+    df['avg_pkt_size'] = df['total_bytes'] / (df['total_pkts'] + 1)
+    df['dur_per_pkt'] = df['dur'] / (df['total_pkts'] + 1)
+    df['byte_ratio'] = df['sbytes'] / (df['dbytes'] + 1)
+    df['pkt_ratio'] = df['spkts'] / (df['dpkts'] + 1)
+    df['synack_ratio'] = df['synack'] / (df['ackdat'] + 1)
     return df
 
 
-def encode_categoricals(df: pd.DataFrame, encoders: dict = None, fit: bool = True):
+def add_unsw_categorical_dummies(train_df: pd.DataFrame, test_df: pd.DataFrame):
+    """One-hot encode service and state, aligned between train and test."""
+    train_df = pd.get_dummies(train_df, columns=UNSW_ONEHOT_COLS, prefix=UNSW_ONEHOT_COLS)
+    test_df = pd.get_dummies(test_df, columns=UNSW_ONEHOT_COLS, prefix=UNSW_ONEHOT_COLS)
+
+    all_cols = sorted(set(train_df.columns).union(test_df.columns))
+    train_df = train_df.reindex(columns=all_cols, fill_value=0)
+    test_df = test_df.reindex(columns=all_cols, fill_value=0)
+    return train_df, test_df
+
+
+def add_unsw_proto_frequency(train_df: pd.DataFrame, test_df: pd.DataFrame):
+    train_df = train_df.copy()
+    test_df = test_df.copy()
+    proto_freq = train_df['proto'].value_counts(normalize=True).to_dict()
+    train_df[UNSW_FREQ_COL] = train_df['proto'].map(proto_freq).fillna(0.0)
+    test_df[UNSW_FREQ_COL] = test_df['proto'].map(proto_freq).fillna(0.0)
+    return train_df, test_df
+
+
+def encode_categoricals(df: pd.DataFrame, categorical_cols: list, encoders: dict = None, fit: bool = True):
     """
     Label-encode categorical columns.
     If fit=True, fit new encoders. Otherwise use provided encoders (for test set).
@@ -38,7 +121,7 @@ def encode_categoricals(df: pd.DataFrame, encoders: dict = None, fit: bool = Tru
         encoders = {}
 
     df = df.copy()
-    for col in CATEGORICAL_COLS:
+    for col in categorical_cols:
         if fit:
             le = LabelEncoder()
             df[col] = le.fit_transform(df[col].astype(str))
@@ -90,26 +173,67 @@ def preprocess(
     Full preprocessing pipeline.
 
     Returns:
-        X_train, X_test, y_train, y_test, feature_names
+        X_train, X_test, y_train, y_test, feature_names, label_names
     """
     print(f"[1/5] Loading data (mode={mode})...")
-    train_df = load_raw(train_path)
-    test_df  = load_raw(test_path)
+    train_path, test_path = discover_dataset_paths(train_path, test_path)
 
-    # Drop difficulty column (not a feature)
-    train_df.drop(columns=['difficulty'], inplace=True)
-    test_df.drop(columns=['difficulty'], inplace=True)
+    if test_path is None:
+        full_df = load_raw(train_path)
+        full_df.drop(columns=['difficulty'], inplace=True)
 
-    print("[2/5] Mapping labels...")
-    train_df = map_labels(train_df, mode=mode)
-    test_df  = map_labels(test_df,  mode=mode)
+        print("[2/5] Mapping labels...")
+        full_df = map_labels(full_df, mode=mode)
+
+        print("[2.5/5] Splitting combined dataset into train/test...")
+        train_df, test_df = train_test_split(
+            full_df,
+            test_size=0.20,
+            stratify=full_df['label'],
+            random_state=42
+        )
+        print(f"  Split: train={len(train_df)} rows, test={len(test_df)} rows")
+        label_names = LABEL_NAMES_BINARY if mode == 'binary' else NSL_LABEL_NAMES
+
+    elif train_path.lower().endswith('.parquet'):
+        train_df = load_raw(train_path)
+        test_df  = load_raw(test_path)
+
+        print("[2/5] Mapping labels for UNSW-NB15...")
+        train_df, test_df, label_names = map_unsw_labels(train_df, test_df, mode=mode)
+
+        print("[2.5/5] Building derived UNSW features...")
+        train_df = add_unsw_derived_features(train_df)
+        test_df = add_unsw_derived_features(test_df)
+
+        print("[2.6/5] Adding UNSW categorical dummies...")
+        train_df, test_df = add_unsw_categorical_dummies(train_df, test_df)
+
+        print("[2.7/5] Adding UNSW proto frequency feature...")
+        train_df, test_df = add_unsw_proto_frequency(train_df, test_df)
+
+    else:
+        train_df = load_raw(train_path)
+        test_df  = load_raw(test_path)
+
+        # Drop difficulty column (not a feature)
+        train_df.drop(columns=['difficulty'], inplace=True)
+        test_df.drop(columns=['difficulty'], inplace=True)
+
+        print("[2/5] Mapping labels...")
+        train_df = map_labels(train_df, mode=mode)
+        test_df  = map_labels(test_df,  mode=mode)
+        label_names = LABEL_NAMES_BINARY if mode == 'binary' else NSL_LABEL_NAMES
 
     print("[3/5] Encoding categorical features...")
-    train_df, encoders = encode_categoricals(train_df, fit=True)
-    test_df, _         = encode_categoricals(test_df, encoders=encoders, fit=False)
-
-    # Separate features and labels
-    feature_names = [c for c in COLUMNS if c not in ('label', 'difficulty')]
+    if train_path.lower().endswith('.parquet'):
+        train_df, encoders = encode_categoricals(train_df, UNSW_CATEGORICAL_COLS, fit=True)
+        test_df, _         = encode_categoricals(test_df,  UNSW_CATEGORICAL_COLS, encoders=encoders, fit=False)
+        feature_names = [c for c in train_df.columns if c not in ('label', 'attack_cat')]
+    else:
+        train_df, encoders = encode_categoricals(train_df, CATEGORICAL_COLS, fit=True)
+        test_df, _         = encode_categoricals(test_df, CATEGORICAL_COLS, encoders=encoders, fit=False)
+        feature_names = [c for c in COLUMNS if c not in ('label', 'difficulty')]
     X_train = train_df[feature_names].values.astype(np.float32)
     y_train = train_df['label'].values
     X_test  = test_df[feature_names].values.astype(np.float32)
@@ -130,7 +254,7 @@ def preprocess(
         joblib.dump(encoders, 'models/encoders.pkl')
         print("  Saved scaler and encoders to models/")
 
-    return X_train, X_test, y_train, y_test, feature_names
+    return X_train, X_test, y_train, y_test, feature_names, label_names
 
 
 if __name__ == '__main__':

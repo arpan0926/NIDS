@@ -16,6 +16,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import f1_score, accuracy_score
+from sklearn.utils.class_weight import compute_sample_weight
 
 from preprocess import preprocess
 
@@ -37,15 +38,18 @@ def get_models():
         "Neural Network (MLP)": MLPClassifier(
             hidden_layer_sizes=(128, 64, 32),
             activation='relu',
-            max_iter=100,
+            solver='adam',
+            max_iter=200,
             early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=10,
             random_state=42
         )
     }
 
 
 def train_all(mode: str = 'multiclass'):
-    X_train, X_test, y_train, y_test, feature_names = preprocess(mode=mode)
+    X_train, X_test, y_train, y_test, feature_names, _ = preprocess(mode=mode)
 
     models   = get_models()
     results  = {}
@@ -57,10 +61,13 @@ def train_all(mode: str = 'multiclass'):
     print(f"  Training {len(models)} models | mode={mode}")
     print("="*55)
 
+    sample_weight = compute_sample_weight('balanced', y_train)
+    print(f"  Sample weights computed for {len(np.unique(y_train))} classes.")
+
     for name, model in models.items():
         print(f"\n>> {name}")
         t0 = time.time()
-        model.fit(X_train, y_train)
+        model.fit(X_train, y_train, sample_weight=sample_weight)
         elapsed = time.time() - t0
 
         y_pred   = model.predict(X_test)
